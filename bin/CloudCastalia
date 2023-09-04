@@ -1,0 +1,959 @@
+#!/usr/bin/env python3
+
+import argparse
+import shutil
+import socket
+from datetime import datetime, timedelta
+import sys
+import os
+from collections import defaultdict
+import multiprocessing
+import threading
+import itertools
+import subprocess
+import queue
+import curses
+import re
+import glob
+from CastaliaLib import ConfigParse
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Process configuration .ini file and run Castalia "
+                                                 "simulation using the specified configuration(s) "
+                                                 "and repetitions. Run without arguments to list "
+                                                 "available configurations found in current directory.")
+
+    parser.add_argument('-c', '--config', type=str, required=False, default='General',
+                        help="The configuration name(s) to use. Comma separated configurations (for example, "
+                             "'-c conf1,conf2' will be merged into a single configuration. "
+                             "Configurations listed in square brackets (for example, '-c [conf1,conf2]', "
+                             "will be run as separate simulations. If two sets of configurations are specified "
+                             "(for example, '-c [conf1,conf2],[conf3,conf4]', every combination of elements "
+                             "from each set will be run. Advanced usage: override a single-value "
+                             "configuration section value using '-c sectionName=value' (special "
+                             "characters such as '\"', '$', '[') may need shell escaping.")
+
+    parser.add_argument('-i', '--input', type=str, required=False, default='omnetpp.ini',
+                        help='Input configuration file, default is omnetpp.ini')
+
+    parser.add_argument('-o', '--outfile', type=str, required=False,
+                        default="{}".format(datetime.now().strftime("%y%m%d-%H%M%S")),
+                        help='Output file for writing results merged from all runs. '
+                             'If not specified, a timestamp is used. '
+                             'A temporary folder containing individual run results is also created '
+                             'named [--outfile]-split before merging. This can be kept using --splitresults')
+
+    parser.add_argument('-r', '--repeat', type=int, required=False, default=1,
+                        help='Number of repetitions to run for each configuration')
+
+    parser.add_argument('--startseed', type=int, required=False, default=0,
+                        help='Start RNG seed increment at specified number. '
+                             'By default, RNG seed is repetition number (0,1,2... <-r>-1). '
+                             'This can be used to, for example, run repetitions 5-9 '
+                             'by using -r 5 --startseed 5')
+
+    parser.add_argument('-t', '--threads', type=int, required=False, default=1,
+                        help='Number of threads to use for running simulation configurations in parallel. '
+                             'Should not be greater than the number of CPU cores available to the machine.')
+
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='Debug mode, will display all output from each CastaliaBin execution. '
+                             'Curses interface will not be used (--nocurses). Output from simulations '
+                             'running in parallel will be interleaved, so it may help to use only '
+                             '1 thread (see --threads)')
+
+    parser.add_argument('--splitresults', action='store_true',
+                        help='In addition to saving the merged results file, save individual results files '
+                             'from each run. These will be stored in a directory named [--outfile]-split')
+
+    parser.add_argument('--confoutdir', type=str, required=False,
+                        help='Save an independent configuration .ini file for each independent run / repetition '
+                             'in the specified folder. This can be useful in conjunction with --norun to '
+                             'distribute simulations across multiple machines.')
+
+    parser.add_argument('--confindir', type=str, required=False,
+                        help='Run all configurations contained in specified folder. Designed to be used with '
+                             'configurations previously generated with --confoutdir. Only General configuration '
+                             'from each file will be run.')
+
+    parser.add_argument('--clobber', action='store_true',
+                        help='Force overwriting any existing output directory (specified by --output)')
+
+    parser.add_argument('-n', '--norun', action='store_true',
+                        help='Do not run simulations, just display run configurations identified. '
+                             'Can be useful in conjunction with --confoutdir if you want to '
+                             'generate individual configurations to distribute across multiple machines')
+
+    parser.add_argument('--nocurses', action='store_true',
+                        help='Do not use full-screen Curses UI for displaying simulation progress. '
+                             'No progress indication will be displayed.')
+
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    """
+        Uses the specified omnetpp.ini input file and specified configuration(s) argument to run Castalia,
+        using the following rules:
+        
+        * The General configuration section is always used
+        
+        * If the configuration argument is not General (for example, MyConfiguration):
+            - MyConfiguration section is combined with General
+            - If the same parameter is defined in both General and MyConfiguration, the value set in
+              MyConfiguration will overwrite that in General
+              
+        * The configuration argument can be in the following forms:
+            - The name of a single configuration
+            - Comma separated configurations, for example:
+                Castalia -c MyConfiguration1,MyConfiguration2
+              These configurations will be joined together. If the same parameter is defined in multiple
+              of these sections, an error will be raised. The resulting configuration will be labelled
+              as 'MyConfiguration1,MyConfiguration2'
+            - Comma separated configurations inside square braces, for example:
+                Castalia -c [MyConfiguration1,MyConfiguration2]
+              These configurations will be run separately in different simulations
+            - Combination of the above. For example:
+                Castalia -c [A,B]C,D[E,F]
+              This will execute 4 combined configurations:
+              A,C,D,E
+              B,C,D,E
+              A,C,D,F
+              B,C,D,F
+            - A redefinition of a single-parameter config section. If a config section only defines
+              a single value, we can set the value in the configuration argument using the form
+              configSectionName=newValue. For example:
+                Castalia -c MyConfiguration="NewStringValue"
+                Castalia -c MyConfiguration=10
+                Castalia -c MyConfiguration=${1,2,3}    
+                    Note: in bash the above example needs command line escaping to avoid substitution by the shell i.e.
+                    Castalia -c MyConfiguration=\$\{1,2,3\}
+        
+        * A series of values can be specified for a parameter inside curly braces.
+          This can be in the following forms:
+            - param = ${name=value1,value2,value3}
+            - param = ${value1,value2,value3}
+          Each value is run in a separate simulation run. If 'name' is given, the name is used in the
+          label given for the simulation run. If 'name' is not given, a simple incrementing integer 
+          assigned to each un-named parameter series and used as the label
+    """
+
+    # If Castalia is called with no arguments, don't just fall back on argparse defaults -
+    # instead print out a list of available .ini files and configurations found in calling
+    # directory, then exit
+    if len(sys.argv) == 1:
+        ConfigParse.print_available_configurations()
+        sys.exit()
+
+    ############################################
+    # Parse command line args and check validity
+    ############################################
+    args = parse_args()
+    out_tmp_results_folder = "{}-split".format(args.outfile)
+
+    if not os.path.isfile(args.input):
+        sys.exit("ERROR: no such configuration file {}".format(args.input))
+    if (os.path.exists(args.outfile) or os.path.exists(out_tmp_results_folder)) and not args.clobber:
+            sys.exit("ERROR: Results out path {} or {} already exists. To force overwrite of existing results, "
+                     "use the --clobber argument.".format(args.outfile, out_tmp_results_folder))
+    if (args.confoutdir and os.path.exists(args.confoutdir)) and not args.clobber:
+            sys.exit("ERROR: Configuration out folder {} already exists. To force overwrite of existing results, "
+                     "use the --clobber argument.".format(args.confoutdir))
+    if args.config.startswith(',') or args.config.endswith(','):
+        sys.exit("ERROR: Configuration parameter cannot start or end with a comma: {}".format(args.config))
+    if '=' in args.config and '[' in args.config:
+        sys.exit("ERROR: Cannot mix value assignment (section=value) with interleaving ([config1,config2]): {}"
+                 .format(args.config))
+    if args.threads < 0:
+        sys.exit("ERROR: threads argument cannot be negative")
+    if args.threads > multiprocessing.cpu_count():
+        sys.exit("ERROR: threads argument should not be greater than the number of available CPU cores ({})".format(
+            multiprocessing.cpu_count()))
+    if args.repeat < 0:
+        sys.exit("ERROR: --repeat argument cannot be negative")
+    if args.startseed < 0:
+        sys.exit("ERROR: --startseed argument cannot be negative")
+    if args.confindir and args.confoutdir:
+        sys.exit("Can't use --confindir in combination with --confoutdir")
+
+    # Check that we can see the CastaliaBin symbolic link, which should be located 1 directory
+    # up from the bin folder. Using __file__ to locate the bin folder, this is the folder which
+    # this script file is in. Then join '../' to go 'up' one directory
+    path_to_castalia_bin = "{}/CastaliaBin".format(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
+
+    if not os.path.isfile(path_to_castalia_bin):
+        sys.exit("ERROR: CastaliaBin not found at {} - (need to run make?)".format(path_to_castalia_bin))
+
+
+    # If user has not specified a folder of input files which are ready to go
+    if not args.confindir:
+
+        ############################################
+        # Read / parse the ini file
+        ############################################
+        combined_ini_file_with_includes = ConfigParse.load_ini_file_with_includes_inserted(args.input)
+        config_sections_dicionary = ConfigParse.parse_ini_file(combined_ini_file_with_includes)
+
+        ############################################
+        # Use -c config argument to create user
+        # requested simulation configurations
+        ############################################
+
+        # Create an empty dict to store all configurations to be run
+        configurations_to_run = defaultdict(lambda: defaultdict(str))
+
+        # If the config argument is specifying a single configuration
+        if '=' not in args.config \
+                and ',' not in args.config \
+                and '[' not in args.config:
+
+            # Merge the single configuration into general and add to the list of configs to run
+            configurations_to_run[args.config] = ConfigParse.merge_configs_into_general(config_sections_dicionary, [args.config])
+
+        # If the config argument is specifying multiple comma separated values not in brackets (e.g. config1,config2)
+        elif ',' in args.config \
+                and '=' not in args.config \
+                and '[' not in args.config:
+
+            configurations_to_run[args.config] = ConfigParse.merge_configs_into_general(config_sections_dicionary, args.config.split(','))
+
+        # If the config argument is specifying comma separated configurations inside square braces
+        elif ',' in args.config \
+                and '[' in args.config \
+                and '=' not in args.config:
+
+            # This can get complicated!
+            # config argument may be in the following forms:
+            # [config1,config2]
+            # [config1,config2],config3
+            # [config1,config2],config3,[config4,config5]
+            # Configs in square brackets are to be run as *separate* configurations (not merged)
+            # Multiple blocks of configurations in different sets of brackets means create every combination
+            # e.g. [A,B],[C,D] means we need 4 separate configs:
+            # A,C
+            # A,D
+            # B,C
+            # B,D
+            # Additional configurations outside of brackets are joined to all combinations
+            # e.g. [A,B]C,D[E,F] should result in 4 configurations:
+            #      This will execute 4 combined configurations:
+            #      A,C,D,E
+            #      B,C,D,E
+            #      A,C,D,F
+            #      B,C,D,F
+
+            # Therefore define regex for extracting everything inside brackets
+            # \[ and \] : [ and ] are a meta-chars and must be escaped
+            # (.*?) : matches everything
+            regex_text_inside_brackets = r'\[(.*?)\]'
+
+            # First get a list of all bracket sets. For example, if we are given
+            # [A,B]C,D[E,F]
+            # This regex findall will return this list:
+            # ['A,B', 'E,F']
+            configuration_sets = re.findall(regex_text_inside_brackets, args.config)
+
+            # If there is only 1 bracket set found
+            if len(configuration_sets) == 1:
+                # Just split these into separate configuration sets
+                configuration_sets = configuration_sets[0].split(',')
+
+            # Else if there is more than 1 bracket set found
+            else:
+                # We need to create all combinations of configurations from each setmerge_configurations
+                # For example, if we have found ['A,B', 'E,F'], we need to create
+                # ['A,E','A,F','B,E','B,F']
+
+                # Split regex result into a list of lists
+                # e.g. ['A,B', 'E,F']  -->  [['A','B'],['E','F']]
+                configuration_sets = [sim_set.split(',') for sim_set in configuration_sets]
+                # Create every combination of configuration from each set
+                # e.g. [['A','B'],['E','F']]  -->  [('A','E'), ('A','F'), ('B','E'), ('B','F')]
+                configuration_sets = list(itertools.product(*configuration_sets))
+                # Join the tuple combinations back into single comma separated strings of configurations
+                # e.g. [('A','E'), ('A','F'), ('B','E'), ('B','F')]  -->  ['A,E', 'A,F', 'B,E', 'B,F']
+                configuration_sets = [','.join(sim_set) for sim_set in configuration_sets]
+
+            # Now make sure that if there are any configurations outside of brackets,
+            # these are joined into each and every combination of configurations
+            # Extract these by splitting on sets of brackets '[' and ']'
+            additional_configurations = (s.split(']')[-1] for s in args.config.split('['))
+            # This split may yield blank elements, and elements with trailing / leading commas. Remove blank
+            # elements and strip trailing / leading commas
+            additional_configurations = [element.strip(',') for element in additional_configurations if element != '']
+            # The result may be a list of more than 1 strings, each string may be a comma separated list
+            # e.g. [A,B],C,D,[E,F],G  will yield [[C,D], [G]]
+            # so split all additional finds on comma
+            additional_configurations = [additional_string.split(',') for additional_string in additional_configurations]
+            # we end up with a list of lists, which we chain together using ',' to form 1 single consolidated
+            # string of additional configs
+            additional_configurations = ','.join(list(itertools.chain.from_iterable(additional_configurations)))
+
+            # Now we can combine any additional configurations found with each and every configuration set using a ','
+            if len(additional_configurations) > 0:
+                configuration_sets = ['{},{}'.format(configuration_set, additional_configurations)
+                                      for configuration_set in configuration_sets]
+
+            # Finally, merge each configuration set into a single configuration to run
+            for configuration_set in configuration_sets:
+                configurations_to_run[configuration_set] = ConfigParse.merge_configs_into_general(
+                    config_sections_dicionary, configuration_set.split(','))
+
+        # If the config argument is specifying a single-parameter config section to override
+        elif '=' in args.config \
+                and '[' not in args.config:
+
+            # If a configuration section is setting a single parameter, we can redefine it at command line
+            # For example if varyDutyCycle is a configuration section with 1 parameter (dutyCycle), we can type:
+            #   Castalia -c varyDutyCycle=0.03
+            # This will set the single variable of the configuration varyDutyCycle (i.e.dutyCycle) to 0.03. We
+            # can use whatever expression we would use in a configuration file. For example we can assign a range of
+            # values. Therefore we need to handle all the following forms:
+            # 'setParam="text"'
+            # 'setParam=val'
+            # 'setParam=${name=val1,val2,val3}'
+            # 'setParam=${val1,val2,val3}'
+
+            # Get the configuration section name (left of the '=') and value to override the single parameter to (right)
+            # We need to preserve quotes in the value. Split on '=' at most once to avoid accidentally splitting values
+            # in form 'setParam=${name=val1,val2,val3}'
+            section_to_override, value_to_set = args.config.split('=', 1)
+
+            # Check there were values on both sides of the '='
+            if not section_to_override or not value_to_set:
+                sys.exit("ERROR: using a section override (conf=value) in configuration argument "
+                         "but missing conf section name or value")
+
+            # Check the configuration name exists
+            if section_to_override not in config_sections_dicionary:
+                sys.exit("ERROR: configuration section {} not found".format(section_to_override))
+            # Check the configuration has only 1 parameter
+            if len(config_sections_dicionary[section_to_override]) > 1:
+                sys.exit("ERROR: attempting to override section with more than 1 parameter")
+
+            # Set the value of the single key-value pair in the dict to the value_to_set
+            config_section_to_change = config_sections_dicionary[section_to_override]
+            config_section_to_change[list(config_section_to_change.keys())[0]] = value_to_set
+
+            # Merge the modified configuration into general and add to the list of configs to run
+            configurations_to_run[section_to_override] = ConfigParse.merge_configs_into_general(
+                config_sections_dicionary, [section_to_override])
+
+        else:
+            sys.exit("ERROR: Unrecognised configuration argument: {}".format(args.config))
+
+        ##################################################
+        # Create separate configurations for all
+        # parameter sweeps (aka 'studies') and repetitions
+        ##################################################
+
+        # configurations_to_run is a dictionary of configurations to run in Castalia.
+        # Each key of the dictionary is the configuration label. The value is a dictionary
+        # of configuration parameters. E.g. if the user ran:
+        #   Castalia -c [A,B]C
+        # There are two entries:
+        #   - Key: 'A,C'    Value: { dictionary of parameter key/pairs merged from A and C }
+        #   - Key: 'B,C'    Value: { dictionary of parameter key/pairs merged from B and C }
+
+        # Split out any parameter sweeps into separate configurations, and create the required number
+        # of repetitions, 1 config for each repetition with RNG seed set to the repetition number
+        # In the returned dict, the key is a tuple of run labels describing the run, the value is a dict of parameters
+        all_param_sweeps_and_reps_configurations = \
+            ConfigParse.explode_parameter_sweeps_and_reps_into_separate_configs(configurations_to_run, args.repeat, args.startseed)
+
+        # Print message showing configurations / parameter sweeps / repetitions to run
+        print("Found the following simulation runs:")
+        for run_labels in sorted(all_param_sweeps_and_reps_configurations.keys()):
+            print("Configuration: {}, {}Repetition: {}".format(
+                run_labels[0],
+                "Parameters: {}, ".format(run_labels[1]) if len(run_labels[1]) > 0 else "",
+                run_labels[2]
+            ))
+        print("(Total of {} runs)".format(len(all_param_sweeps_and_reps_configurations)))
+
+        ############################################
+        # Write out configuration files
+        ############################################
+        # Write all configurations out to .ini files, 1 for each experimental run
+        # From Omnet manual, the following parameters can be used to label experiments:
+        #
+        # experiment-label   (defaults to "${configname}")
+        # measurement-label  (defaults to "${iterationvars}")
+        # replication-label  (defaults to "#${repetition},seed-set=<seedset>")
+        #
+        # These are normally set automatically, but because we are splitting out measurements /
+        # replications into separate files, we need to set these manually
+
+        # Append a unique ID to the filename to make configurations unique, by using a simple counter:
+        run_id_counter = 1
+
+        # Keep a list of info about the files generated, to use later in the processing queue
+        run_files_info = []
+
+        for run_labels in sorted(all_param_sweeps_and_reps_configurations.keys()):
+
+            # all_param_sweeps_and_reps_configurations is a dict in the form:
+            #
+            # {
+            #    (<experiment-label>, <measurement-label>, <repetition-label>):
+            #       {
+            #           param = value
+            #           param2: value
+            #           ...etc
+            #       }
+            # }
+
+            # Give the file a unique name
+            tmp_ini_file_path = 'omnetpp.{}.tmp'.format(run_id_counter)
+
+            # Add the run ID, configuration labels filename to the list
+            run_files_info.append((run_id_counter, run_labels, tmp_ini_file_path))
+
+            # Write the config to file
+            with open(tmp_ini_file_path, 'w') as tmp_ini_writer:
+
+                # We are dynamically creating a new file for each configuration. Therefore just using
+                # 'General' for the configuration section name.
+                tmp_ini_writer.write('[{}]\n'.format('General'))
+
+                # Write the experiment labels at the top of the config file to make them easier to read
+                # experiment-label = the original configuration section name in the original .ini file
+                # measurement-label = the list of parameter sweep values (if any)
+                # replication-label = the repetition number (which is also the RNG seed)
+                tmp_ini_writer.write('SN.castalia_run_id = {}\n'.format(run_id_counter))  # use underscores here - hyphens indicate special parameters
+                tmp_ini_writer.write('experiment-label = \"{}\"\n'.format(run_labels[0]))
+                tmp_ini_writer.write('measurement-label = \"{}\"\n'.format(run_labels[1]))
+                tmp_ini_writer.write('replication-label = \"{}\"\n'.format(run_labels[2]))
+
+                # Then add the parameters for this run
+                parameter_dict = all_param_sweeps_and_reps_configurations[run_labels]
+                for parameter in sorted(parameter_dict.keys()):
+                    tmp_ini_writer.write('{} = {}\n'.format(parameter, parameter_dict[parameter]))
+
+            run_id_counter += 1
+
+    ##############################################
+    # Else if the user has supplied a folder of config files ready to go
+    else:
+        # Read file info into a list of info about the files , to use later in the processing queue
+        run_files_info = []
+
+        if not os.path.isdir(args.confindir):
+            sys.exit("folder {} does not exit".format(args.confindir))
+
+        for subdir, dirs, files in os.walk(args.confindir):
+            for config_file in files:
+                with open(os.path.join(args.confindir, config_file)) as config_file_reader:
+                    for line in config_file_reader:
+                        if 'SN.castalia_run_id' in line:
+                            run_id = line.split('=', 1)[1].strip()
+                            if not run_id.isdigit():
+                                sys.exit("Error parsing run ID {}".format(run_id))
+
+                        elif 'experiment-label' in line:
+                            experiment_label = line.split('=', 1)[1].strip()
+                        elif 'measurement-label' in line:
+                            measurement_label = line.split('=', 1)[1].strip()
+                        elif 'replication-label' in line:
+                            replication_label = line.split('=', 1)[1].strip()
+
+
+
+                    if not run_id or not experiment_label or not measurement_label or not replication_label:
+                        sys.exit("Could not find ID or run labels in file {}".format(config_file))
+                    run_files_info.append((int(run_id), [experiment_label,measurement_label,replication_label],
+                                           # Note: specifying path as being in the parent directory not the confindir
+                                           # This is because were going to copy the files to the parent before running
+                                           config_file))
+
+                # Copy the file to the parent directory. Need to do this because Castalia
+                # uses the config file location as the root directory, so it must be in the right place
+                # NOte: these copied files will be deleted after simulation
+                shutil.copyfile(os.path.join(args.confindir, config_file), config_file)
+
+
+    ##############################################
+    # Prepare for running simulations in parallel,
+    # define required runnables, queues etc.
+    ##############################################
+
+    # A queue for simulations. The queue will contain the info on configurations to run, which were generated
+    # above. A tuple containing (<run ID>, <config filename>)
+    simulation_queue = queue.Queue()
+
+    for run_file_info in run_files_info:
+        simulation_queue.put(run_file_info)
+
+    # Queues for outputting progress messages from all simulations / threads.
+    # Using queue so that we can collect runtime output from multiple threads,
+    # and consume them in the main thread in a thread-safe way
+    # stdout queue for collecting stdout messages to post to curses:
+    stdout_progress_queue = queue.Queue()
+    # log queue for streaming simulation stats to a log file, e.g. how long each simulation took
+    log_file_queue = queue.Queue()
+
+
+    def parallel_worker(simulation_queue, stdout_progress_queue, log_file_queue, outdir, debug):
+        """
+            This is the thread worker which launches a subprocess for a simulation, pipes progress
+            messages from Castalia stdout to the stdout progress message queue (to be read by curses)
+            and saves results / errors to file
+
+            :param log_file_queue: an output queue to log messages such as simulation run time etc.
+            :param simulation_queue: an input queue of simulation jobs to run. Threads consume this queue.
+            :param stdout_progress_queue: an output queue to put progress messages on (consumed by curses)
+            :param outdir: directory to save results
+            :param debug: if set, all output from castalia is printed to console
+        """
+        while True:
+
+            # If the simulation queue is empty
+            if simulation_queue.empty():
+
+                # Wait until all running simulations have complete
+                simulation_queue.join()
+
+                # Signal to the progress queue consumer (e.g. curses) that everything has finished by
+                # putting None on the queue (None is used as the 'sentinel' value)
+                stdout_progress_queue.put(None)
+
+                # Break out of the While True loop to exit the worker (and stop the thread)
+                break
+
+            else:
+                # Get the run ID and filename for the next simulation to run
+                run_id, run_labels, tmp_ini_filename = simulation_queue.get()
+
+                # Record the start time
+                start_sim_time = datetime.now()
+
+                # Run the simulation as a subprocess (this does not block)
+                args = [path_to_castalia_bin, '-f', tmp_ini_filename]
+                simulation = subprocess.Popen(args, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+                # Construct results output file paths for saving output and errors
+                out_filepath = os.path.join(outdir, 'results-{}.txt'.format(run_id))
+
+                # Declare an error writer variable
+                # Will be initialised if error detected, and all subsequent stdout data
+                # will be saved to that file
+                error_file_writer = None
+                # Flag, set to true if error encountered
+                error_encountered = False
+
+                # Open for writing
+                with open(out_filepath, 'w') as out_file_writer:
+
+                    # Write the label for this individual run
+                    #
+                    # CastaliaResults expects each run to be labelled in the following way:
+                    # Castalia| repeat:0 label:testConf1,testConf2,0=4,1=y_coord=10
+
+                    # run_labels is a tuple containing (<experiment-label>, <measurement-label>, <repetition-label>)
+                    out_file_writer.write("Castalia| repeat:{} label:{}{}\n".format(
+                        run_labels[2],
+                        run_labels[0],
+                        ",{}".format(run_labels[1]) if len(run_labels[1]) > 0 else ""))
+
+                    # Read from the stdout pipe
+                    for stdout_bytes in iter(simulation.stdout.readline, b''):
+
+                        line = stdout_bytes.decode("utf-8")
+
+                        # If we have read a line with '<!> Error', everything subsequent goes
+                        # in the error file
+                        if error_encountered:
+                            error_file_writer.write(line)
+
+                        # A line starting '<!> Error' indicates an error, open the error file
+                        # and set the error_encountered flag
+                        elif line.startswith('<!> Error'):
+
+                            error_logs_dir = 'error-logs'
+
+                            if not os.path.exists(error_logs_dir):
+                                os.mkdir(error_logs_dir)
+
+                            error_filepath = os.path.join(error_logs_dir, 'error-{}.txt'.format(run_id))
+                            error_file_writer = open(error_filepath, 'w')
+
+                            # Write run labels to the error file
+                            error_file_writer.write("Error file for configuration {}{}, repeat {}\n\n".format(
+                                run_labels[0],
+                                ",{}".format(run_labels[1]) if len(run_labels[1]) > 0 else "",
+                                run_labels[2]))
+
+                            # Write error text to error file
+                            error_file_writer.write(line)
+
+                            # Write error text to progress queue
+                            stdout_progress_queue.put((run_id, run_labels, line))
+
+                            # Set error flag to true. This will mean any other messages following
+                            # the error will also go to the error file
+                            error_encountered = True
+
+                        # Output progress messages to the progress queue
+                        # Progress messages are in form:
+                        # ** Event #1554432   T=13.831191902795   Elapsed: 2.000s (0m 02s)  1% completed   ev/sec=777216\n
+                        elif '** Event' in line:
+                            stdout_progress_queue.put((run_id, run_labels, line))
+
+                        # Output results messages to results file
+                        elif 'Castalia|' in line:
+
+                            out_file_writer.write(line)
+
+                        # Print to console if debugging enabled
+                        if debug:
+                            # Use end='' to omit the newline after print - line already contains a \n
+                            print('Run {}: {}'.format(run_id, line), end='')
+
+                # Close the error file if it was opened
+                if error_file_writer is not None:
+                    error_file_writer.close()
+
+                if error_encountered:
+                    log_file_queue.put("{}: Run ID {} label {}{} rep {} ERROR - see error log {}".format(
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        run_id,
+                        run_labels[0],
+                        ",{}".format(run_labels[1]) if len(run_labels[1]) > 0 else "",
+                        run_labels[2],
+                        error_filepath))
+                else:
+                    log_file_queue.put("{}: Run ID {} label {}{} rep {} complete in {}".format(
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        run_id,
+                        run_labels[0],
+                        ",{}".format(run_labels[1]) if len(run_labels[1]) > 0 else "",
+                        run_labels[2],
+                        str(datetime.now() - start_sim_time).split('.')[0]))  # split removes microseconds
+
+                # When complete, mark the simulation queue task as done
+                simulation_queue.task_done()
+
+
+    def curses_display(stdscr, stdout_progress_queue, number_simulations, number_threads, number_cores_available):
+        """
+            The curses display logic is contained in this function, and is used as the
+            runnable for curses.wrapper.
+
+            Picks up Castalia progress messages from multiple Castalia instances using the progress message queue,
+            displays this info using progress bars and labels
+
+        :param number_threads: how many threads are being used, displayed as info
+        :param number_cores_available: how many cores are available to use, displayed as info
+        :param number_simulations: how many simulations are being run, displayed as info
+        :param stdout_progress_queue: the queue from which to pick up progress messages from Castalia
+        :param stdscr: The whole-screen curses window created when curses is initialised
+        """
+
+        # We want the user to be able to interrupt the process with a keypress (q for quit)
+        # TO do this need to set nodelay(True), means that getkey() and getch() do not block and wait
+        # getch() returns curses.ERR (a value of -1) and getkey() raises an exception if
+        # no input available
+        stdscr.nodelay(True)
+
+        # Display formatting
+        top_margin = 3  # Top padding for listing the simulations (to make room for column headers, info text)
+        progress_bar_length = 10  # Length of the progress bar to display
+        col_pos_run_id = 0
+        col_pos_progress_bar = col_pos_run_id + 4
+        col_pos_elapsed = col_pos_progress_bar + progress_bar_length + 10  # Column horizontal positions
+        col_pos_events_per_sec = col_pos_elapsed + 11
+        col_pos_repetition = col_pos_events_per_sec + 13
+        col_pos_run_labels = col_pos_repetition + 5
+
+        # Add some help text
+        stdscr.addstr(0, 0, "Running {} simulations using {} of {} cores - press 'q' to quit".format(
+            number_simulations, number_threads, number_cores_available))
+        if number_threads < number_cores_available:
+            stdscr.addstr(1, 0, "Use --threads to increase number of threads used")
+
+        # Add column headers
+        #              1   [##########] 100.0% (0m 09s)   10m 56s      3  Lerwick10Min,Short
+        stdscr.addstr(2, 0,
+                      "ID  Progress            Elapsed    ETA          Rep  Configuration")
+
+        # Read messages from the stdout queue. All running simulations post their output onto
+        # this queue, in the form of a tuple containing:
+        # (<run ID>, (<experiment-label>, <measurement-label>, <repetition-label>), <message>)
+        # Use None as the sentinel value - this means that as soon as we read a None object on
+        # the queue, the loop exits (all simulations have finished)
+        for run_id, run_labels, stdout_string in iter(stdout_progress_queue.get, None):
+
+            # Calculate the row number for printing the simulation progress in the terminal window
+            # Run ID is an incrementing integer, so we can use this as incrementing row number
+            # to display info about each simulation on a different row
+            # If we have reached the end of the terminal window vertical space (curses.ROWS)
+            # wrap around to the start
+
+            update_curses_row = (run_id % (curses.LINES - top_margin)) + top_margin
+
+            # Check for progress messages from a simulation in the form:
+            # ** Event #1554432   T=13.831191902795   Elapsed: 2.000s (0m 02s)  1% completed   ev/sec=777216\n
+            if '** Event' in stdout_string:
+
+                # Parse the information from the string
+                re_update_percentage = re.search(r'[0-9]+%', stdout_string)
+                re_update_simtime = re.search(r'T=[0-9.]+', stdout_string)
+                re_update_elapsed_wallclock = re.search(r'\([0-9]+m\s[0-9]+s\)', stdout_string)
+                re_update_events_per_sec = re.search(r'ev/sec=\S+', stdout_string)
+
+                if re_update_percentage and re_update_simtime \
+                        and re_update_elapsed_wallclock and re_update_events_per_sec:
+
+                    # Construct the progress bar in the form:
+                    # [#####-----] 50%
+                    update_percentage_float = float(re_update_percentage.group(0).replace('%', ''))
+                    block = int(round(progress_bar_length * (update_percentage_float / 100.0)))
+                    progress_bar_txt = '[{0}] {1}%'.format( "#"*block + "-"*(progress_bar_length-block), update_percentage_float)
+
+                    # The info for each simulation is printed on a separate line
+                    # Use the run_id as the line number (plus a margin)
+                    # First we need to clear the line (clrtoeol) before printing the latest information
+                    stdscr.move(update_curses_row, 0)
+                    stdscr.clrtoeol()
+
+                    # Format the text we want to display
+                    txt_run_id = str(run_id)
+                    txt_elapsed = re_update_elapsed_wallclock.group(0)
+                    txt_events_per_sec = re_update_events_per_sec.group(0).replace('ev/sec=', '')
+                    txt_repetition = str(run_labels[2])
+                    txt_run_labels = '{}{}'.format(run_labels[0], ',{}'.format(
+                            run_labels[1]) if len(run_labels[1]) > 0 else '')
+
+                    # Calculate ETA
+                    # First parse the time string form Castalia
+                    elapsed_time_parsed = datetime.strptime(txt_elapsed, '(%Mm %Ss)').time()
+                    # Convert to a timedelta object
+                    elapsed_time_delta = timedelta(hours=elapsed_time_parsed.hour, minutes=elapsed_time_parsed.minute,seconds=elapsed_time_parsed.second)
+
+                    if elapsed_time_delta.total_seconds() == 0 or update_percentage_float == 0:
+                        txt_eta = "Inf"
+                    else:
+                        # Estimate how much time it will take in total
+                        estimated_total_time = timedelta(seconds=elapsed_time_delta.total_seconds() * (100.0 / update_percentage_float))
+                        # ETA is remaining time
+                        eta = estimated_total_time - elapsed_time_delta
+                        # String format without the microseconds
+                        txt_eta = str(eta).split(".")[0]
+
+                    # Run labels is an unknown variable length string. Truncate if longer than terminal space available
+                    space_left_for_run_labels = curses.COLS - col_pos_run_labels - 2
+                    if space_left_for_run_labels >= 3:
+                        txt_truncated_run_labels = txt_run_labels[:space_left_for_run_labels-3] + '...' \
+                            if len(txt_run_labels) > space_left_for_run_labels \
+                            else txt_run_labels
+                    else:
+                        txt_truncated_run_labels = ''
+
+                    # Print the information for this simulation
+                    # Check we have enough horizontal space on the screen (curses.COLS) to print each
+                    # column before calling addstr, otherwise curses will throw an exception
+                    stdscr.addstr(update_curses_row, col_pos_run_id, txt_run_id)
+                    if col_pos_elapsed < curses.COLS:
+                        stdscr.addstr(update_curses_row, col_pos_progress_bar, progress_bar_txt)
+                    if col_pos_events_per_sec < curses.COLS:
+                        stdscr.addstr(update_curses_row, col_pos_elapsed, txt_elapsed)
+                    if col_pos_repetition < curses.COLS:
+                        stdscr.addstr(update_curses_row, col_pos_events_per_sec, txt_eta)
+                    if col_pos_run_labels < curses.COLS:
+                        stdscr.addstr(update_curses_row, col_pos_repetition, txt_repetition)
+                    # In some circumstances curses throws an ERR on the following addstrm,
+                    # with no detail about why. Curses is so poorly documented and cryptic, after hours of
+                    # swearing (cursing?) decided just to catch and continue here
+                    try:
+                        if len(txt_truncated_run_labels) > 0:
+                            stdscr.addstr(update_curses_row, col_pos_run_labels, txt_truncated_run_labels)
+                    except:
+                        pass
+
+            # Check for error messages
+            elif stdout_string.startswith('<!> Error'):
+                stdscr.move(update_curses_row, col_pos_elapsed)
+                stdscr.addstr(update_curses_row, col_pos_elapsed, "!Error! See error-logs  ")
+
+            # Need to call refresh for update to appear
+            stdscr.refresh()
+
+            # Check if the user as aborted by pressing q
+            # Need to wrap this in a try catch - because were using nodelay(True), geykey() does
+            # not block and wait, but throws an exception if no key has been pressed
+            try:
+                key_press = stdscr.getkey()
+                if key_press.lower() == 'q':
+                    stdscr.move(0, 0)
+                    stdscr.clrtoeol()
+                    stdscr.addstr(0, 0, "Simulations aborted. Press any key")
+                    stdscr.refresh()
+
+                    # Wait for key press
+                    stdscr.nodelay(False)
+                    stdscr.getkey()
+
+                    # Returning will exit curses and end simulation threads
+                    return
+            except:
+                # No input key pressed - just pass
+                pass
+
+        # Display complete message
+        stdscr.move(0, 0)
+        stdscr.clrtoeol()
+        stdscr.addstr(0, 0, "Simulations complete. Press any key")
+        stdscr.refresh()
+
+        # Wait for key press
+        stdscr.nodelay(False)
+        stdscr.getkey()
+
+
+    class WriteLogFileThread(threading.Thread):
+        """
+            Class for writing log messages from multiple running sim threads to a single file
+            Threads post tasks to log file queue, this thread reads them and writes to file
+        """
+
+        def __init__(self, log_file_queue, log_file_path):
+            threading.Thread.__init__(self)
+            self.log_file_queue = log_file_queue
+            self.log_file_path = log_file_path
+
+        def run(self):
+
+            while True:
+                log_message = self.log_file_queue.get()
+                with open(self.log_file_path, 'a') as log_file_writer:
+                    log_file_writer.write('\n{}'.format(log_message))
+                self.log_file_queue.task_done()
+
+
+    #####################################################
+    # Run simulations (unless user has specified --norun)
+    #####################################################
+    if not args.norun:
+
+        # Delete the temp output folder if it already exists (we have already checked at the start that,
+        # if it already exists, the user must have specified the --clobber argument to allow deletion)
+        if os.path.exists(out_tmp_results_folder):
+            shutil.rmtree(out_tmp_results_folder)
+
+        os.mkdir(out_tmp_results_folder)
+
+        # record start of all simualtions
+        start_all_sims_time = datetime.now()
+
+        # Enter run info to the log queue
+        log_file_queue.put("\n{}: Running {} simulations on {} using:\n\t--repeat {}\n\t--startseed {}\n\t--threads {}\n\t--config {}".format(
+            start_all_sims_time.strftime("%Y-%m-%d %H:%M:%S"),
+            len(run_files_info),
+            socket.gethostname(),
+            args.repeat,
+            args.startseed,
+            args.threads,
+            args.config
+        ))
+
+        # Create the number of processing threads specified and start them running castalia simulations.
+        # This many simulations will be run in parallel at once. When a thread completes a simulation, it
+        # will look in the queue for the next one available.
+        for i in range(args.threads):
+            t = threading.Thread(target=parallel_worker, args=(simulation_queue,
+                                                               stdout_progress_queue,
+                                                               log_file_queue,
+                                                               out_tmp_results_folder,
+                                                               args.debug))
+            t.daemon = True
+            t.start()
+
+        # Create a logging thread which will read log messages from processing threads and write to log file
+        t = WriteLogFileThread(log_file_queue, 'castalia.log')
+        t.daemon = True
+        t.start()
+
+        # User can ask not to display curses - this can be useful if there are python runtime
+        # error messages which are not displayed in a readable way by curses
+        # Also, don't use curses if debugging enabled
+        if args.nocurses or args.debug:
+            print("Running simulations...")
+            # Wait for the simulations to complete.
+            simulation_queue.join()
+        else:
+            # Start curses and display progress
+            # Pass in display info about number of simulations being run, no of threads, cores
+            curses.wrapper(curses_display, stdout_progress_queue, len(run_files_info), args.threads, multiprocessing.cpu_count())
+            # No need to wait for the simualtion_queue to join. Curses will block and exit
+            # when simulations complete.
+
+        # Record total run time
+        log_file_queue.put("{}: all simulations complete, total run time (using {} threads): {}".format(
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            args.threads,
+            str(datetime.now() - start_all_sims_time).split('.')[0]  # split removes microseconds
+        ))
+
+        # Wait for all remaining log file messages to be processed
+        log_file_queue.join()
+
+        #####################################################
+        # Consolidate results in a single results file which
+        # can be read by CastaliaResults
+        #####################################################
+        # Open a single merged results file
+        with open(args.outfile, 'w') as combined_out_file_writer:
+
+            # Write labels at the start of the file to identify the time, configuration argument used and
+            # number of repetitions
+            #
+            # CastaliaResults expects results file in the form:
+            #
+            # Castalia| what:testConf1,testConf2 (2)
+            # Castalia| when:2017-12-23 16:26
+            # Castalia| repeat:0 label:testConf1,testConf2,0=4,1=y_coord=10
+            # Castalia|       module:SN.node[0].Communication.Radio
+            # Castalia|               simple output name:RX pkt breakdown
+            # Castalia|                       882 Failed with NO interference
+            # Castalia|                       8668 Failed with interference
+            # ...etc
+
+            combined_out_file_writer.write("Castalia| what:{} ({}-{})\n".format(
+                args.config,
+                args.startseed,
+                args.repeat))
+            combined_out_file_writer.write("Castalia| when:{}\n".format(
+                datetime.now().strftime("%Y-%m-%d %H:%M")))
+
+            # Read each individual result file from each simulation run
+            # and write to combined file
+            individual_result_files = glob.glob(os.path.join(out_tmp_results_folder, '*'))
+            for individual_result_file in individual_result_files:
+                with open(individual_result_file, 'r') as individual_result_reader:
+                    for line in individual_result_reader:
+                        combined_out_file_writer.write(line)
+
+        # Delete the temporary individual result file directory, unless user has specified to save it
+        if not args.splitresults:
+            shutil.rmtree(out_tmp_results_folder)
+
+    # If the user has specified --confoutdir, move all the individual generated conf ini files
+    # into the specified directory. Otherwise, delete them
+    if args.confoutdir:
+        # Delete the conf output folder if it already exists (we have already checked at the start that,
+        # if it already exists, the user must have specified the --clobber argument to allow deletion)
+        if os.path.exists(args.confoutdir):
+            shutil.rmtree(args.confoutdir)
+
+        os.mkdir(args.confoutdir)
+
+        for run_file_info in run_files_info:
+            # The file path is the third value in the file info tuple
+            shutil.move(run_file_info[2], os.path.join(args.confoutdir, run_file_info[2]))
+
+    # Otherwise, delete
+    else:
+        for run_file_info in run_files_info:
+            # The file path is the third value in the file info tuple
+            os.remove(run_file_info[2])
